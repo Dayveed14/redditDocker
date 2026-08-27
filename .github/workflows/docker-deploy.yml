@@ -393,7 +393,7 @@ jobs:
             ubuntu@$EC2_IP \
             "
               sudo docker pull \
-                ${{ secrets.DOCKERHUB_USERNAME }}/my-node-api:latest
+                ${{ secrets.DOCKERHUB_USERNAME }}/reddit-api:latest
 
               sudo docker stop api || true
 
@@ -404,7 +404,7 @@ jobs:
                 --restart unless-stopped \
                 --env-file /home/ubuntu/api.env \
                 -p 7000:7000 \
-                ${{ secrets.DOCKERHUB_USERNAME }}/my-node-api:latest
+                ${{ secrets.DOCKERHUB_USERNAME }}/reddit-api:latest
             "
 
 
