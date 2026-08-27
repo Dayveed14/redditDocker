@@ -139,7 +139,7 @@ jobs:
 
           INSTANCE_IP=$(aws ec2 describe-instances \
             --filters \
-              "Name=tag:Name,Values=reddit-docker-api" \
+              "Name=tag:Name,Values=reddit-api" \
               "Name=instance-state-name,Values=running" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text 2>/dev/null || echo "")
@@ -393,7 +393,7 @@ jobs:
             ubuntu@$EC2_IP \
             "
               sudo docker pull \
-                ${{ secrets.DOCKER_USERNAME }}/my-node-api:latest
+                ${{ secrets.DOCKERHUB_USERNAME }}/my-node-api:latest
 
               sudo docker stop api || true
 
@@ -404,7 +404,7 @@ jobs:
                 --restart unless-stopped \
                 --env-file /home/ubuntu/api.env \
                 -p 7000:7000 \
-                ${{ secrets.DOCKER_USERNAME }}/my-node-api:latest
+                ${{ secrets.DOCKERHUB_USERNAME }}/my-node-api:latest
             "
 
 
