@@ -1,0 +1,469 @@
+name: Test and Deploy Docker App to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+
+  # ============================================================
+  # JOB 1: TEST + BUILD + PUSH DOCKER IMAGE
+  # ============================================================
+
+  test:
+    name: Test and Build Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout source code
+      # ----------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+
+      # ----------------------------------------------------------
+      # Setup Node.js
+      # ----------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+
+      # ----------------------------------------------------------
+      # Install dependencies
+      # ----------------------------------------------------------
+      - name: Install Dependencies
+        run: npm ci
+
+
+      # ----------------------------------------------------------
+      # Run Jest tests
+      # ----------------------------------------------------------
+      - name: Run Jest Tests
+        env:
+          MONGO_URI: mongodb://localhost:27017/test
+          JWT_SECRET: test-secret-key
+          CLOUDINARY_API_SECRET_KEY: test-cloudinary-secret
+          CLOUDINARY_API_KEY: test-cloudinary-key
+          CLOUDINARY_CLOUD_NAME: test-cloudinary-cloud
+        run: npm test
+
+
+      # ----------------------------------------------------------
+      # Build Docker image
+      # ----------------------------------------------------------
+      - name: Build Docker Image
+        run: |
+          docker build -t reddit-api .
+
+
+      # ----------------------------------------------------------
+      # Login to Docker Hub
+      # ----------------------------------------------------------
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+
+      # ----------------------------------------------------------
+      # Push Docker image to Docker Hub
+      # ----------------------------------------------------------
+      - name: Push Docker Image
+        run: |
+          docker tag reddit-api \
+            ${{ secrets.DOCKERHUB_USERNAME }}/reddit-api:latest
+
+          docker push \
+            ${{ secrets.DOCKERHUB_USERNAME }}/reddit-api:latest
+
+
+  # ============================================================
+  # JOB 2: TERRAFORM + DEPLOY TO NEW EC2
+  # ============================================================
+
+  deploy:
+    name: Provision and Deploy Docker Container
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout repository
+      # ----------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # ----------------------------------------------------------
+      # Check whether Terraform files changed
+      # ----------------------------------------------------------
+      - name: Check for Terraform Changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+
+
+      # ----------------------------------------------------------
+      # Configure AWS credentials
+      # ----------------------------------------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+
+      # ----------------------------------------------------------
+      # Check whether the NEW Docker EC2 already exists
+      # ----------------------------------------------------------
+      - name: Check if Docker EC2 Instance Exists
+        id: check_ec2
+        run: |
+
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=reddit-docker-api" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text 2>/dev/null || echo "")
+
+
+          if [ -z "$INSTANCE_IP" ] || [ "$INSTANCE_IP" = "None" ]; then
+
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+
+            echo "Docker EC2 instance does not exist."
+
+          else
+
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+
+            echo "ip=$INSTANCE_IP" >> "$GITHUB_OUTPUT"
+
+            echo "Docker EC2 instance exists."
+
+            echo "IP: $INSTANCE_IP"
+
+          fi
+
+
+      # ----------------------------------------------------------
+      # Setup Terraform
+      # ----------------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+
+      # ----------------------------------------------------------
+      # Provision NEW EC2 if necessary
+      # ----------------------------------------------------------
+      - name: Run Terraform Apply
+        if: >
+          steps.check_ec2.outputs.exists == 'false' ||
+          steps.filter.outputs.terraform == 'true' ||
+          github.event_name == 'workflow_dispatch'
+
+        run: |
+
+          cd terraform
+
+          terraform init
+
+
+          # Create temporary private key file
+          echo "${{ secrets.EC2_SSH_KEY }}" > ec2_key.pem
+
+          chmod 600 ec2_key.pem
+
+
+          # Generate public key from private key
+          SSH_PUBLIC_KEY=$(ssh-keygen -y -f ec2_key.pem)
+
+
+          # Delete private key immediately
+          rm ec2_key.pem
+
+
+          # Apply Terraform
+          terraform apply \
+            -auto-approve \
+            -var="ssh_public_key=$SSH_PUBLIC_KEY" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+
+
+      # ----------------------------------------------------------
+      # Determine which EC2 IP to deploy to
+      # ----------------------------------------------------------
+      - name: Determine Deployment IP
+        id: deploy_ip
+        run: |
+
+          if [ "${{ steps.check_ec2.outputs.exists }}" = "false" ] || \
+             [ "${{ steps.filter.outputs.terraform }}" = "true" ] || \
+             [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+
+            cd terraform
+
+            EC2_IP=$(terraform output -raw ec2_public_ip)
+
+            cd ..
+
+          else
+
+            EC2_IP="${{ steps.check_ec2.outputs.ip }}"
+
+          fi
+
+
+          echo "ip=$EC2_IP" >> "$GITHUB_OUTPUT"
+
+          echo "Deployment Target IP: $EC2_IP"
+
+
+      # ----------------------------------------------------------
+      # Create SSH private key
+      # ----------------------------------------------------------
+      - name: Prepare SSH Key
+        run: |
+
+          echo "${{ secrets.EC2_SSH_KEY }}" > ec2_key.pem
+
+          chmod 600 ec2_key.pem
+
+
+      # ----------------------------------------------------------
+      # Wait for SSH
+      # ----------------------------------------------------------
+      - name: Wait for EC2 SSH
+        run: |
+
+          EC2_IP="${{ steps.deploy_ip.outputs.ip }}"
+
+
+          echo "Waiting for SSH on $EC2_IP..."
+
+
+          for i in {1..30}; do
+
+            if ssh \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=5 \
+              -i ec2_key.pem \
+              ubuntu@$EC2_IP \
+              "echo SSH connection successful" 2>/dev/null; then
+
+              echo "SSH is ready."
+
+              break
+
+            fi
+
+
+            if [ $i -eq 30 ]; then
+
+              echo "Timed out waiting for SSH."
+
+              exit 1
+
+            fi
+
+
+            echo "Waiting for SSH... ($i/30)"
+
+            sleep 10
+
+          done
+
+
+      # ----------------------------------------------------------
+      # Wait for Docker
+      # ----------------------------------------------------------
+      - name: Wait for Docker Installation
+        run: |
+
+          EC2_IP="${{ steps.deploy_ip.outputs.ip }}"
+
+
+          echo "Waiting for Docker on EC2..."
+
+
+          for i in {1..30}; do
+
+            if ssh \
+              -o StrictHostKeyChecking=no \
+              -i ec2_key.pem \
+              ubuntu@$EC2_IP \
+              "sudo docker --version >/dev/null 2>&1"; then
+
+              echo "Docker is ready."
+
+              break
+
+            fi
+
+
+            if [ $i -eq 30 ]; then
+
+              echo "Timed out waiting for Docker."
+
+              exit 1
+
+            fi
+
+
+            echo "Waiting for Docker... ($i/30)"
+
+            sleep 10
+
+          done
+
+
+      # ----------------------------------------------------------
+      # Create production environment file on EC2
+      # ----------------------------------------------------------
+      - name: Create Production Environment File
+        run: |
+
+          EC2_IP="${{ steps.deploy_ip.outputs.ip }}"
+
+
+          echo "Creating production environment file..."
+
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ec2_key.pem \
+            ubuntu@$EC2_IP \
+            "cat > /home/ubuntu/api.env <<'EOF'
+          NODE_ENV=production
+          NODE_PORT=7000
+          MONGO_URI=${{ secrets.MONGO_URI }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          CLOUDINARY_API_SECRET_KEY=${{ secrets.CLOUDINARY_API_SECRET_KEY }}
+          CLOUDINARY_API_KEY=${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_CLOUD_NAME=${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          EOF"
+
+
+          # Restrict access to environment file
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ec2_key.pem \
+            ubuntu@$EC2_IP \
+            "chmod 600 /home/ubuntu/api.env"
+
+
+          echo "Production environment file created."
+
+
+      # ----------------------------------------------------------
+      # Deploy Docker container
+      # ----------------------------------------------------------
+      - name: Deploy Docker Container
+        run: |
+
+          EC2_IP="${{ steps.deploy_ip.outputs.ip }}"
+
+
+          echo "Deploying Docker container to $EC2_IP..."
+
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ec2_key.pem \
+            ubuntu@$EC2_IP \
+            "
+              sudo docker pull \
+                ${{ secrets.DOCKER_USERNAME }}/my-node-api:latest
+
+              sudo docker stop api || true
+
+              sudo docker rm api || true
+
+              sudo docker run -d \
+                --name api \
+                --restart unless-stopped \
+                --env-file /home/ubuntu/api.env \
+                -p 7000:7000 \
+                ${{ secrets.DOCKER_USERNAME }}/my-node-api:latest
+            "
+
+
+      # ----------------------------------------------------------
+      # Verify Docker container
+      # ----------------------------------------------------------
+      - name: Verify Docker Container
+        run: |
+
+          EC2_IP="${{ steps.deploy_ip.outputs.ip }}"
+
+
+          echo "Checking Docker container..."
+
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ec2_key.pem \
+            ubuntu@$EC2_IP \
+            "sudo docker ps"
+
+
+          echo "Testing API health endpoint..."
+
+
+          sleep 5
+
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ec2_key.pem \
+            ubuntu@$EC2_IP \
+            "curl --fail http://localhost:7000/api/health"
+
+
+      # ----------------------------------------------------------
+      # Show container logs if deployment succeeds
+      # ----------------------------------------------------------
+      - name: Show Docker Logs
+        if: always()
+        run: |
+
+          EC2_IP="${{ steps.deploy_ip.outputs.ip }}"
+
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ec2_key.pem \
+            ubuntu@$EC2_IP \
+            "sudo docker logs --tail 50 api || true"
+
+
+      # ----------------------------------------------------------
+      # Remove SSH private key from GitHub runner
+      # ----------------------------------------------------------
+      - name: Cleanup SSH Key
+        if: always()
+        run: |
+
+          rm -f ec2_key.pem
+
+          echo "SSH key cleaned up."
